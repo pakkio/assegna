@@ -36,6 +36,7 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import linprog
 from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
 
 MAX_RELOCATION_KM = 30.0
 OVER_CAP_PENALTY_PER_KM = 0.06   # a full 0-to-1 fit swing only justifies ~17km over the cap
@@ -56,28 +57,99 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
 
 
+def to_ecef(lat, lon):
+    """Lat/lon (on Earth's surface) to 3D Cartesian -- so a KD-tree's ordinary
+    Euclidean distance corresponds to great-circle distance (a KD-tree over raw
+    lat/lon would distort distances badly near the poles and across the dateline)."""
+    latr, lonr = np.radians(lat), np.radians(lon)
+    return np.stack([
+        EARTH_RADIUS_KM * np.cos(latr) * np.cos(lonr),
+        EARTH_RADIUS_KM * np.cos(latr) * np.sin(lonr),
+        EARTH_RADIUS_KM * np.sin(latr),
+    ], axis=-1)
+
+
+MAX_SKILL_LEVEL = 5  # quantized proficiency: 0 inadequate .. 5 genius-level (6 levels)
+
+
 def capability_matrix(entities, key, pool):
+    """Build an (entities, pool) matrix. A capability entry can be either a plain
+    list (presence only, e.g. a place's required_capabilities -- every required
+    capability counts as level 1/1) or a dict {capability: level} with level in
+    0..MAX_SKILL_LEVEL (a person's quantized proficiency, normalized to [0, 1]).
+
+    This is pure objective data, computed once here in numpy before the LP ever
+    runs -- it feeds combined_score_matrix's cap_score, which only ever appears
+    in the LP's objective vector `c`, never in the constraint matrix `A` or its
+    right-hand side `b`. Total unimodularity (why the assignment LP lands on an
+    exact 0/1 solution) is a statement about A and b alone; c can be any real
+    number, including these normalized proficiency floats, with zero effect on
+    integrality.
+    """
     idx = {c: i for i, c in enumerate(pool)}
     m = np.zeros((len(entities), len(pool)))
     for i, e in enumerate(entities):
-        for c in e[key]:
-            m[i, idx[c]] = 1
+        caps = e[key]
+        if isinstance(caps, dict):
+            for c, level in caps.items():
+                m[i, idx[c]] = level / MAX_SKILL_LEVEL
+        else:
+            for c in caps:
+                m[i, idx[c]] = 1.0
     return m
 
 
+# Any distance beyond HARD_CAP_KM is masked to -1e9 anyway (never offered as a
+# candidate), so it never needs to be exact -- just finite and unambiguously beyond
+# every cap this module checks against (HARD_CAP_KM, MAX_RELOCATION_KM). Finite
+# (not inf) so downstream arithmetic (over_cap penalty) can't produce nan/inf.
+_SENTINEL_KM = HARD_CAP_KM + 1.0e6
+
+
 def combined_score_matrix(people, places, pool):
-    """(len(people), len(places)) matrix of capability-fit-minus-distance-penalty."""
+    """(len(people), len(places)) matrix of capability-fit-minus-distance-penalty.
+
+    Exact haversine distance is only computed for (person, place) pairs within
+    HARD_CAP_KM of each other -- found via a KD-tree radius query on places' ECEF
+    positions, not a dense len(people) x len(places) distance matrix. Every pair
+    outside that radius gets a sentinel distance beyond every cap this module
+    checks, without spending a haversine call on it -- everyone else's exact
+    distance is unaffected, and the eventual mask (dist > HARD_CAP_KM -> -1e9)
+    lands on identical entries either way.
+
+    This matters because most pairs ARE beyond HARD_CAP_KM: each place only draws
+    people from a small radius, not the whole map. On a 30k-employee / 1000-place
+    benchmark this cut the dominant cost of the whole reassignment pipeline from
+    ~1.75s to ~0.03s (each employee has only ~2.4 places within reach on average,
+    out of 1000) -- see bench_haversine.* and the README's "Language vs.
+    algorithm" section for the full comparison against rewriting this same dense
+    loop in C or Scala instead (a ~1.5x win, dwarfed by this ~50x algorithmic one).
+    """
     p_caps = capability_matrix(people, "capabilities", pool)
     pl_caps = capability_matrix(places, "required_capabilities", pool)
     req_counts = pl_caps.sum(axis=1)
     req_counts[req_counts == 0] = 1
     cap_score = (p_caps @ pl_caps.T) / req_counts  # (people, places)
 
-    p_lat = np.array([p["lat"] for p in people])[:, None]
-    p_lon = np.array([p["lon"] for p in people])[:, None]
-    pl_lat = np.array([p["lat"] for p in places])[None, :]
-    pl_lon = np.array([p["lon"] for p in places])[None, :]
-    dist = haversine_km(p_lat, p_lon, pl_lat, pl_lon)
+    n_people, n_places = len(people), len(places)
+    p_lat = np.array([p["lat"] for p in people])
+    p_lon = np.array([p["lon"] for p in people])
+    pl_lat = np.array([p["lat"] for p in places])
+    pl_lon = np.array([p["lon"] for p in places])
+
+    dist = np.full((n_people, n_places), _SENTINEL_KM)
+    if n_people and n_places:
+        tree = cKDTree(to_ecef(pl_lat, pl_lon))
+        # chord length of a HARD_CAP_KM great-circle arc -- Euclidean distance in
+        # the ECEF embedding is a monotonic function of great-circle distance, so
+        # "within this chord" and "within HARD_CAP_KM great-circle" pick out
+        # exactly the same set of places.
+        chord = 2 * EARTH_RADIUS_KM * np.sin(HARD_CAP_KM / (2 * EARTH_RADIUS_KM))
+        candidates = tree.query_ball_point(to_ecef(p_lat, p_lon), r=chord)
+        row_idx = np.concatenate([np.full(len(c), i, dtype=int) for i, c in enumerate(candidates)])
+        col_idx = np.concatenate([np.asarray(c, dtype=int) for c in candidates])
+        if row_idx.size:
+            dist[row_idx, col_idx] = haversine_km(p_lat[row_idx], p_lon[row_idx], pl_lat[col_idx], pl_lon[col_idx])
 
     over_cap = np.maximum(0.0, dist - MAX_RELOCATION_KM)
     combined = cap_score - over_cap * OVER_CAP_PENALTY_PER_KM

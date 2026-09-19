@@ -128,10 +128,13 @@ for place in places:
     tiers = ["A"] * n_a + ["B"] * n_b + ["C"] * n_c
     for tier in tiers:
         lat, lon = jitter_on_land(place["lat"], place["lon"], max_km=15.0)
+        n_caps = random.randint(2, 4)
         employees.append({
             "id": emp_id,
             "name": f"Emp{emp_id}",
-            "capabilities": random.sample(CAPS_POOL, k=random.randint(2, 4)),
+            # quantized proficiency per capability: 1 (weakly adapted) .. 5 (genius-level);
+            # 0 (inadequate) is never listed -- omission from the dict already means 0
+            "capabilities": {c: random.randint(1, 5) for c in random.sample(CAPS_POOL, k=n_caps)},
             "lat": lat,
             "lon": lon,
             "tier": tier,
@@ -152,7 +155,7 @@ for i in range(NEW_CANDIDATES):
         "id": i + 1,
         "name": f"Candidate{i + 1}",
         "continent": continent,
-        "capabilities": random.sample(CAPS_POOL, k=random.randint(2, 4)),
+        "capabilities": {c: random.randint(1, 5) for c in random.sample(CAPS_POOL, k=random.randint(2, 4))},
         "lat": lat,
         "lon": lon,
         "allow_relocating": random.random() < 0.80,
