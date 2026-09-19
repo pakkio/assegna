@@ -374,6 +374,77 @@ def solve_joint_all(employees, candidates, places, pool, capacity, place_idx):
     return emp_result, cand_result, home_col, dist_e, dist_c
 
 
+def solve_priority_stage(people, places, pool, capacity, place_idx):
+    """Stage 1 of the lexicographic priority solve: 'important' people get first claim
+    on capacity, solved as free movers -- no substitution/backfill requirement, same
+    exemption tier C already gets. That's what makes it a HARD guarantee rather than a
+    score nudge: this stage doesn't know the rest of the workforce exists yet, so
+    nothing outside this group can ever make an important person's outcome worse.
+
+    Returns (chosen_edges, home_col, dist) in this group's own local indices.
+    """
+    n_places = len(places)
+    combined, cap_score, dist = combined_score_matrix(people, places, pool)
+    home_col = np.array([place_idx[e["place_id"]] for e in people])
+    combined = apply_mobility_rules(combined, dist, people, home_col)
+    edges = top_k_edges(combined, TOP_K, must_include_col=home_col)
+    place_capacity = {i: capacity[i] for i in range(n_places)}
+    chosen = solve_sparse_bmatching(len(people), edges, place_capacity, force_full=True)
+    return chosen, home_col, dist
+
+
+def solve_joint_priority(employees, candidates, places, pool, capacity, place_idx):
+    """Two-stage lexicographic solve: 'important' employees are placed FIRST (stage 1,
+    solve_priority_stage), then everyone else -- non-important employees and new-hire
+    candidates -- is solved jointly as usual (solve_joint_all) against whatever
+    capacity and A/B backlog remains (stage 2).
+
+    Trade-off vs. the single joint LP: stage 1 can't see stage 2's movers, so a
+    cross-group substitution (an important A/B's departure backfilled by a
+    not-yet-decided non-important C) is never considered -- important people are
+    exempted from the substitution rule entirely instead, which is what makes the
+    guarantee hold. In exchange, an important person's outcome can NEVER be worse
+    because of who else needed a seat, and is completely unaffected by the order
+    people are listed in -- stage 1 is itself an order-free joint LP over the
+    important group, exactly like solve_joint_all is for everyone.
+
+    Falls back to a single call to solve_joint_all (no priority stage) when no
+    employee is flagged important, so this is a strict superset of the old behavior.
+    """
+    n_places = len(places)
+    important_idx = [i for i, e in enumerate(employees) if e.get("important")]
+    rest_idx = [i for i, e in enumerate(employees) if not e.get("important")]
+
+    if not important_idx:
+        return solve_joint_all(employees, candidates, places, pool, capacity, place_idx)
+
+    important = [employees[i] for i in important_idx]
+    rest = [employees[i] for i in rest_idx]
+
+    imp_edges, imp_home_col, imp_dist = solve_priority_stage(important, places, pool, capacity, place_idx)
+
+    imp_assigned_count = np.zeros(n_places)
+    for _, j, _ in imp_edges:
+        imp_assigned_count[j] += 1
+    remaining_capacity = capacity - imp_assigned_count
+    if (remaining_capacity < -1e-6).any():
+        raise RuntimeError("stage 1 (important) overcommitted capacity -- should be impossible "
+                            "under force_full with per-place capacity bounds")
+    remaining_capacity = remaining_capacity.clip(min=0)
+
+    rest_emp_result, cand_result, rest_home_col, rest_dist, dist_c = solve_joint_all(
+        rest, candidates, places, pool, remaining_capacity, place_idx)
+
+    emp_result = [(important_idx[i], j, s) for (i, j, s) in imp_edges] + \
+                 [(rest_idx[i], j, s) for (i, j, s) in rest_emp_result]
+
+    # full (n_emp, n_places) distance matrix for reporting, same shape main() expects
+    _, _, dist = combined_score_matrix(employees, places, pool)
+    home_col = np.array([place_idx[e["place_id"]] for e in employees])
+
+    return emp_result, cand_result, home_col, dist, dist_c
+
+
 def main():
     global OVER_CAP_PENALTY_PER_KM, HARD_CAP_KM
     parser = argparse.ArgumentParser()
@@ -399,7 +470,7 @@ def main():
     # Measured to strictly beat solving new hires afterward: +2.3 total score and
     # 7 more hires placed on this dataset, same or better solve time -- see
     # solve_joint_all's docstring.
-    emp_result, n_result, home_col, dist, dist_n = solve_joint_all(
+    emp_result, n_result, home_col, dist, dist_n = solve_joint_priority(
         employees, candidates, places, pool, capacity, place_idx)
 
     assigned_count = np.zeros(n_places)
