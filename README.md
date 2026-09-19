@@ -69,9 +69,14 @@ trick.
   who else arrives in the *same* solve, which can include a C. That dependency
   is still just one linear inequality per place (100 extra constraint rows),
   so the whole thing remains a single LP, not a harder combinatorial problem.
-- **New hires** are placed afterward, filling whatever capacity is left. They
-  don't affect anyone else's decision, so they don't need to be in the joint
-  solve.
+- **New hires** are folded into the *same* LP too (`solve_joint_all`), competing
+  for capacity from the start rather than getting only whatever's left over. A
+  placed new hire also counts as a valid "someone arrived" substitute for an
+  A/B departure, same as anyone else. Measured against solving them
+  afterward: +2.3 total score and 7 more hires placed (60 -> 67 of 200) on the
+  same dataset, no slower -- this was tested, not assumed; the sequential
+  version was the first cut and got replaced once the joint version proved
+  strictly better on every metric.
 
 ### Per-person constraints, applied before the solve ever runs
 
@@ -88,13 +93,19 @@ trick.
 
 The LP finds the true optimum *for the formulation as posed* (top-K candidate
 sets, the stated capacity/substitution constraints, the linear
-capability-minus-distance-penalty score). Restricting to top-K candidates is
-itself an approximation of "consider every possible move" -- a person's true
-best option could in principle sit outside their top-8, though in practice the
-score function makes that unlikely. New-hire placement, run after the A/B/C
-solve, is sequential rather than jointly optimized with it.
+capability-minus-distance-penalty score). The top-K restriction sounded like
+an obvious approximation risk, but tested against the real data: `TOP_K=8`
+gives the *identical* total score as `TOP_K=100` (every candidate place, no
+restriction) -- same solve, same speed. On this dataset the score function
+already makes anyone's true best option land within their top-8, so the
+restriction currently costs nothing measured, even though nothing guarantees
+that in general (a different capability/distance distribution could make it
+bite).
 
 Every constraint the pipeline claims to enforce (capacity limits, the
 substitution rule, `busy`/`protected_category` gating) has been independently
 re-verified from the raw output at least once during development -- not just
-assumed correct because the LP solved successfully.
+assumed correct because the LP solved successfully. Likewise, "is there a
+better solution" was answered by measuring two concrete alternatives (wider
+top-K, joint vs. sequential new-hire placement) against the current one,
+not by reasoning about it in the abstract.

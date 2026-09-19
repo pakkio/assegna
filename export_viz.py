@@ -28,11 +28,12 @@ def main():
     place_idx = {p["id"]: i for i, p in enumerate(places)}
     capacity = np.array([p["capacity"] for p in places], dtype=float)
 
-    joint_result, home_col, dist = R.solve_joint_ab_c(employees, places, pool, capacity, place_idx)
+    emp_result, cand_result, home_col, dist, dist_n = R.solve_joint_all(
+        employees, candidates, places, pool, capacity, place_idx)
 
     assigned_count = np.zeros(n_places)
     moves_by_tier = {"A": [], "B": [], "C": []}
-    for i, j, score in joint_result:
+    for i, j, score in emp_result:
         home = int(home_col[i])
         assigned_count[j] += 1
         tier = employees[i]["tier"]
