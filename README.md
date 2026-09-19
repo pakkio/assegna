@@ -124,3 +124,46 @@ assumed correct because the LP solved successfully. Likewise, "is there a
 better solution" was answered by measuring two concrete alternatives (wider
 top-K, joint vs. sequential new-hire placement) against the current one,
 not by reasoning about it in the abstract.
+
+### A proof that the current solution is optimal -- not just "close enough"
+
+Let `P` be the LP's feasible region (real-valued `x` in `[0, 1]^n` satisfying
+the capacity, substitution, and per-person assignment constraints), and let
+`I` be the actual integer (0/1) feasible set -- every real assignment of
+people to places that respects those same rules. Since integrality is an
+*extra* restriction on top of the same linear constraints, `I` subset `P`.
+
+- Let `x*` be the LP's optimum over `P`. For **any** integer-feasible `y` in
+  `I`, `y` is also in `P` (dropping the integrality restriction only adds
+  more candidates), so `c . y <= c . x*` -- `x*`'s value upper-bounds every
+  possible integer assignment, not just ones anyone thought to try.
+- If `x*` itself is integral, then `x*` is in `I` too, achieving that bound
+  exactly. No `y` in `I` can beat it -- `x*` is optimal over `I`.
+
+That argument is airtight *given* two things are actually true: `x*` really
+is the LP's global optimum (not just "the solver reported success"), and
+`x*` really is integral (not a rounded fraction). Both were checked directly
+rather than assumed:
+
+1. **LP optimality, via an independent duality certificate.** Pulled HiGHS's
+   dual solution (shadow prices for every constraint) and computed the dual
+   objective separately from the primal. LP weak duality is a theorem: for
+   *any* primal-feasible `x` and dual-feasible `y`, `primal(x) >= dual(y)`.
+   If they're ever equal, both are proven optimal -- that's the strong
+   duality theorem, not solver trust.
+   ```
+   primal objective: -1384.6884716218524
+   dual objective:   -1384.688471621852
+   duality gap:       4.5e-13   (floating-point noise -- i.e. zero)
+   ```
+2. **Integrality.** Max deviation of any variable from `{0, 1}`: `0.0`
+   exactly (same check `solve_joint_all` now runs and raises on every call --
+   see above).
+
+With both confirmed, the containment argument above is a complete proof, not
+an appeal to the solver's authority: **no integer-feasible assignment can
+score higher than the one this pipeline returns**, for the model as stated
+(this score function, this constraint set, this candidate graph). It does not
+claim to be the best possible reassignment under some *other* objective (e.g.
+minimizing total distance instead of maximizing fit-minus-penalty) -- that
+would be a different LP with a different optimum.
