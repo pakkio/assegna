@@ -1,0 +1,11 @@
+__pycache__/
+.claude/settings.local.json
+
+# large synthetic org data -- regenerable deterministically via gen_org.py (random.seed(7))
+org_employees.json
+org_candidates.json
+org_places.json
+viz_data.json
+
+# build artifact from gen_map_html.py
+match_map.html

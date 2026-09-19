@@ -1,0 +1,72 @@
+[
+  {
+    "id": 1,
+    "name": "Alice Rossi",
+    "capabilities": ["python", "data-analysis", "sql"],
+    "lat": 45.4642,
+    "lon": 9.1900
+  },
+  {
+    "id": 2,
+    "name": "Marco Bianchi",
+    "capabilities": ["javascript", "react", "css"],
+    "lat": 45.4773,
+    "lon": 9.1815
+  },
+  {
+    "id": 3,
+    "name": "Sara Conti",
+    "capabilities": ["project-management", "agile", "communication"],
+    "lat": 45.0703,
+    "lon": 7.6869
+  },
+  {
+    "id": 4,
+    "name": "Luca Ferrari",
+    "capabilities": ["go", "docker", "kubernetes"],
+    "lat": 44.4949,
+    "lon": 11.3426
+  },
+  {
+    "id": 5,
+    "name": "Giulia Romano",
+    "capabilities": ["machine-learning", "python", "pytorch"],
+    "lat": 41.9028,
+    "lon": 12.4964
+  },
+  {
+    "id": 6,
+    "name": "Davide Greco",
+    "capabilities": ["devops", "aws", "terraform"],
+    "lat": 40.8518,
+    "lon": 14.2681
+  },
+  {
+    "id": 7,
+    "name": "Elena Ricci",
+    "capabilities": ["ux-design", "figma", "user-research"],
+    "lat": 43.7696,
+    "lon": 11.2558
+  },
+  {
+    "id": 8,
+    "name": "Francesco Marino",
+    "capabilities": ["java", "spring", "microservices"],
+    "lat": 41.1171,
+    "lon": 16.8719
+  },
+  {
+    "id": 9,
+    "name": "Chiara Esposito",
+    "capabilities": ["marketing", "seo", "content-strategy"],
+    "lat": 38.1157,
+    "lon": 13.3615
+  },
+  {
+    "id": 10,
+    "name": "Matteo Villa",
+    "capabilities": ["rust", "systems-programming", "performance-tuning"],
+    "lat": 45.4408,
+    "lon": 12.3155
+  }
+]
