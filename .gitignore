@@ -16,3 +16,27 @@ world_paths.txt
 
 # stray crash dump, not project output
 bash.exe.stackdump
+
+# C/C++ builds and coverage
+build/
+*.gcda
+*.gcno
+*.gcov
+a.out
+hello
+hello.c
+match2
+bench_haversine_c
+bench_kdtree_c
+test_bench_kdtree
+
+# Scala / sbt
+target/
+project/target/
+project/project/
+.bsp/
+
+# Python tests
+.coverage
+.pytest_cache/
+out/
