@@ -9,3 +9,10 @@ viz_data.json
 
 # build artifact from gen_map_html.py
 match_map.html
+
+# downloaded/derived world-map data -- regenerate via build_world_paths.py
+world.geojson
+world_paths.txt
+
+# stray crash dump, not project output
+bash.exe.stackdump

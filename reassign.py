@@ -8,20 +8,23 @@
 # ///
 """Reassign an existing workforce + place new hires, under a tiered mobility rule:
 
-  A (fixed)   - never moves.
-  B (movable) - may relocate to a better-fitting place if it has spare capacity.
-  C (backfill)- may move ONLY into a slot vacated by a B move (chain rule), never
-                into arbitrary open capacity.
-  New hires   - fill whatever capacity is left after B/C moves.
+  A, B (substitution-gated) - may relocate to a better-fitting place, but ONLY if
+                someone else (any tier) simultaneously arrives at the place they're
+                leaving -- per place, A/B outflow can never exceed any-tier inflow.
+  C   (free)  - moves freely, subject only to capacity and the distance rules; never
+                needs to arrange a replacement for the seat it vacates.
+  New hires   - fill whatever capacity is left after the A/B/C solve.
 
-An exact joint solve over ~7600 employees x 100 places with that chain constraint
-is a large MILP -- not tractable here. Instead this runs a 3-stage pipeline; each
-stage is solved EXACTLY via LP (transportation-problem structure, so the LP
-relaxation is already integral), but the stages are sequential, so the overall
-result is a documented heuristic, not a proven global optimum.
+A and B are solved JOINTLY with C in one LP (not sequential stages): whether an A/B
+person is allowed to leave depends on who else arrives at their place in the SAME
+solve, which can include a C or another A/B -- so it isn't decomposable into
+independent stages the way the old "B first, then C backfills" pipeline was. The
+substitution constraint is still linear (each place: sum of "AB stayed or anyone
+arrived" edges >= that place's original A/B headcount), so the whole thing remains
+one exact LP, not a MILP.
 
 Each person is only offered their top-K candidate places (by combined score) to
-keep every stage's LP small -- also realistic: nobody actually evaluates all 100
+keep the LP a manageable size -- also realistic: nobody actually evaluates all 100
 places before considering a move.
 """
 
@@ -88,16 +91,21 @@ DEPENDENTS_BLOCK_THRESHOLD = 2  # 2+ dependents: no over-cap move offered, regar
 def apply_mobility_rules(combined, dist, people, home_col=None):
     """Mutates nothing; returns a new matrix reflecting each person's individual constraints.
 
-    - allow_relocating == False: only their home place stays viable (full opt-out).
-      For candidates (home_col=None), "home" means anywhere within MAX_RELOCATION_KM
-      of their own address -- they just won't consider a distant job.
+    - allow_relocating == False, or busy == True: only their home place stays viable
+      (full opt-out). "busy" (on a critical project this cycle) is a stronger, temporary
+      version of the same block -- distinct from protected_category, which still allows
+      in-cap moves. For candidates (home_col=None), "home" means anywhere within
+      MAX_RELOCATION_KM of their own address -- they just won't consider a distant job.
     - protected_category == True, or dependents >= threshold: over-cap (>30km) moves
       are never offered, even though the general HARD_CAP_KM would otherwise allow it.
       They can still move for a better fit as long as it's within the 30km cap.
+      This applies per-person, not per-tier -- tier A includes "protected" people
+      (restricted via protected_category), "important" people (no restriction), and
+      "busy" people (fully blocked below), all mixed within the same tier.
     """
     combined = combined.copy()
     for i, person in enumerate(people):
-        no_consent = not person.get("allow_relocating", True)
+        no_consent = not person.get("allow_relocating", True) or person.get("busy", False)
         cap_restricted = person.get("protected_category", False) or \
             person.get("dependents", 0) >= DEPENDENTS_BLOCK_THRESHOLD
 
@@ -183,6 +191,73 @@ def solve_sparse_bmatching(n_entities, edges, place_capacity, force_full=False):
     return [edges[i] for i in range(num_vars) if chosen[i]]
 
 
+def solve_joint_ab_c(employees, places, pool, capacity, place_idx):
+    """Solve A/B/C reallocation as one LP:
+
+    - every employee assigned to exactly one place (their own home is always a
+      valid "stay" option, via top_k_edges' must_include_col)
+    - place capacity: total headcount (any tier) <= capacity[p]
+    - substitution constraint (A/B only): for each place p,
+        (# of A/B who stayed at p) + (# of anyone who arrived at p from elsewhere)
+        >= (# of A/B originally at p)
+      i.e. A/B can leave p only if enough inflow (any tier) covers the gap; a C
+      leaving p is exempt (doesn't count as outflow needing coverage), and a C
+      arriving at p DOES count toward covering someone else's departure.
+
+    Returns (chosen_edges, home_col, dist) where chosen_edges is a list of
+    (employee_idx, place_idx, score).
+    """
+    n_places = len(places)
+    combined, cap_score, dist = combined_score_matrix(employees, places, pool)
+    home_col = np.array([place_idx[e["place_id"]] for e in employees])
+    combined = apply_mobility_rules(combined, dist, employees, home_col)
+    edges = top_k_edges(combined, TOP_K, must_include_col=home_col)
+
+    n = len(employees)
+    tiers = np.array([e["tier"] for e in employees])
+    is_ab = np.isin(tiers, ["A", "B"])
+
+    num_vars = len(edges)
+    entity_of = np.array([e[0] for e in edges])
+    place_of = np.array([e[1] for e in edges])
+    scores = np.array([e[2] for e in edges])
+
+    # per-person: assigned to exactly one place
+    A_eq = csr_matrix((np.ones(num_vars), (entity_of, np.arange(num_vars))), shape=(n, num_vars))
+    b_eq = np.ones(n)
+
+    # capacity rows (0..n_places-1): total headcount at p <= capacity[p]
+    cap_rows = place_of
+    cap_data = np.ones(num_vars)
+
+    # substitution rows (n_places..2*n_places-1): coefficient -1 on any edge that is
+    # either (a) an A/B person staying at their own home, or (b) anyone arriving from
+    # elsewhere -- both count toward covering that place's A/B departures.
+    is_home_edge = place_of == home_col[entity_of]
+    home_is_ab = is_ab[entity_of]
+    covers_departure = (is_home_edge & home_is_ab) | (~is_home_edge)
+    sub_rows = place_of[covers_departure] + n_places
+    sub_cols = np.arange(num_vars)[covers_departure]
+    sub_data = -np.ones(covers_departure.sum())
+
+    all_rows = np.concatenate([cap_rows, sub_rows])
+    all_cols = np.concatenate([np.arange(num_vars), sub_cols])
+    all_data = np.concatenate([cap_data, sub_data])
+    A_ub = csr_matrix((all_data, (all_rows, all_cols)), shape=(2 * n_places, num_vars))
+
+    ab_home_count = np.zeros(n_places)
+    for i, e in enumerate(employees):
+        if e["tier"] in ("A", "B"):
+            ab_home_count[place_idx[e["place_id"]]] += 1
+    b_ub = np.concatenate([capacity, -ab_home_count])
+
+    res = linprog(c=-scores, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=(0, 1), method="highs")
+    if not res.success:
+        raise RuntimeError(f"LP solver failed: {res.message}")
+    chosen = res.x > 0.5
+    return [edges[k] for k in range(num_vars) if chosen[k]], home_col, dist
+
+
 def main():
     global OVER_CAP_PENALTY_PER_KM, HARD_CAP_KM
     parser = argparse.ArgumentParser()
@@ -203,74 +278,24 @@ def main():
     n_places = len(places)
     place_idx = {p["id"]: i for i, p in enumerate(places)}
     capacity = np.array([p["capacity"] for p in places], dtype=float)
-    a_count = np.zeros(n_places)
-    for e in employees:
-        if e["tier"] == "A":
-            a_count[place_idx[e["place_id"]]] += 1
 
-    b_employees = [e for e in employees if e["tier"] == "B"]
-    c_employees = [e for e in employees if e["tier"] == "C"]
+    # ---------- Stage 1: joint A/B/C reallocation ----------
+    joint_result, home_col, dist = solve_joint_ab_c(employees, places, pool, capacity, place_idx)
 
-    b_home_count = np.zeros(n_places)
-    for e in b_employees:
-        b_home_count[place_idx[e["place_id"]]] += 1
-    c_home_count = np.zeros(n_places)
-    for e in c_employees:
-        c_home_count[place_idx[e["place_id"]]] += 1
-
-    # ---------- Stage 1: B relocation ----------
-    # capacity available to the B pool at place j = capacity_j - A_j - C_j (whatever's left
-    # once fixed A and not-yet-moved C are accounted for); shared between B's staying and B's arriving.
-    combined, cap_score, dist = combined_score_matrix(b_employees, places, pool)
-    home_col = np.array([place_idx[e["place_id"]] for e in b_employees])
-    combined = apply_mobility_rules(combined, dist, b_employees, home_col)
-    edges = top_k_edges(combined, TOP_K, must_include_col=home_col)
-
-    stage1_budget = capacity - a_count - c_home_count
-    stage1_cap = {j: float(stage1_budget[j]) for j in range(n_places)}
-
-    b_result = solve_sparse_bmatching(len(b_employees), edges, stage1_cap, force_full=True)
-
-    b_assigned_count = np.zeros(n_places)
-    b_moves, b_stays = [], []
-    for i, j, score in b_result:
+    assigned_count = np.zeros(n_places)
+    moves_by_tier = {"A": [], "B": [], "C": []}
+    stays_by_tier = {"A": [], "B": [], "C": []}
+    for i, j, score in joint_result:
         home = int(home_col[i])
-        b_assigned_count[j] += 1
+        assigned_count[j] += 1
+        tier = employees[i]["tier"]
         if j != home:
-            b_moves.append((b_employees[i], places[j], float(dist[i, j]), score))
+            moves_by_tier[tier].append((employees[i], places[j], float(dist[i, j]), score))
         else:
-            b_stays.append(b_employees[i])
+            stays_by_tier[tier].append(employees[i])
 
-    # net seats actually freed by B churn at each place (departures not refilled by an incoming B)
-    b_net_vacancy = np.maximum(0.0, b_home_count - b_assigned_count)
-
-    # ---------- Stage 2: C backfill (only into places with genuine B-churn vacancy) ----------
-    combined_c, cap_score_c, dist_c = combined_score_matrix(c_employees, places, pool)
-    home_col_c = np.array([place_idx[e["place_id"]] for e in c_employees])
-    combined_c = apply_mobility_rules(combined_c, dist_c, c_employees, home_col_c)
-    edges_c_all = top_k_edges(combined_c, TOP_K, must_include_col=home_col_c)
-    edges_c = [(i, j, s) for (i, j, s) in edges_c_all if b_net_vacancy[j] > 0 or j == int(home_col_c[i])]
-
-    # capacity available to the C pool at place j = the B-churn vacancy (chain rule) plus C's own
-    # current seats there (so staying is always an option regardless of b_net_vacancy)
-    stage2_budget = b_net_vacancy + c_home_count
-    stage2_cap = {j: float(stage2_budget[j]) for j in range(n_places)}
-
-    c_result = solve_sparse_bmatching(len(c_employees), edges_c, stage2_cap, force_full=True)
-
-    c_assigned_count = np.zeros(n_places)
-    c_moves, c_stays = [], []
-    for i, j, score in c_result:
-        home = int(home_col_c[i])
-        c_assigned_count[j] += 1
-        if j != home:
-            c_moves.append((c_employees[i], places[j], float(dist_c[i, j]), score))
-        else:
-            c_stays.append(c_employees[i])
-
-    # ---------- Stage 3: new hires fill whatever is genuinely left ----------
-    occupied_after = a_count + b_assigned_count + c_assigned_count
-    final_open = {j: float(max(0.0, capacity[j] - occupied_after[j])) for j in range(n_places)}
+    # ---------- Stage 2: new hires fill whatever is genuinely left ----------
+    final_open = {j: float(max(0.0, capacity[j] - assigned_count[j])) for j in range(n_places)}
 
     combined_n, cap_score_n, dist_n = combined_score_matrix(candidates, places, pool)
     combined_n = apply_mobility_rules(combined_n, dist_n, candidates, home_col=None)
@@ -278,17 +303,13 @@ def main():
     n_result = solve_sparse_bmatching(len(candidates), edges_n, final_open, force_full=False)
 
     # ---------- report ----------
-    print(f"Stage 1 (B relocation): {len(b_moves)} moved / {len(b_stays)} stayed "
-          f"(of {len(b_employees)} B employees)")
-    exceptions_b = [m for m in b_moves if m[2] > MAX_RELOCATION_KM]
-    print(f"  {len(exceptions_b)} exceeded the 30km cap")
+    for tier, label in [("A", "A relocation"), ("B", "B relocation"), ("C", "C free move")]:
+        n_tier = len(moves_by_tier[tier]) + len(stays_by_tier[tier])
+        print(f"{label}: {len(moves_by_tier[tier])} moved / {len(stays_by_tier[tier])} stayed (of {n_tier})")
+        exceptions = [m for m in moves_by_tier[tier] if m[2] > MAX_RELOCATION_KM]
+        print(f"  {len(exceptions)} exceeded the 30km cap")
 
-    print(f"Stage 2 (C backfill): {len(c_moves)} moved into a B-vacated seat / "
-          f"{len(c_stays)} stayed (of {len(c_employees)} C employees)")
-    exceptions_c = [m for m in c_moves if m[2] > MAX_RELOCATION_KM]
-    print(f"  {len(exceptions_c)} exceeded the 30km cap")
-
-    print(f"Stage 3 (new hires): {len(n_result)} / {len(candidates)} placed")
+    print(f"New hires: {len(n_result)} / {len(candidates)} placed")
     unplaced = len(candidates) - len(n_result)
     if unplaced:
         print(f"  {unplaced} candidate(s) left unplaced -- no viable capacity/fit within reach")
@@ -296,7 +317,7 @@ def main():
     n_assigned_count = np.zeros(n_places)
     for i, j, score in n_result:
         n_assigned_count[j] += 1
-    final_occupied = occupied_after + n_assigned_count
+    final_occupied = assigned_count + n_assigned_count
     over_capacity = final_occupied > capacity + 1e-6
     print(f"Capacity check: {'OK, no place over capacity' if not over_capacity.any() else f'VIOLATED at {over_capacity.sum()} place(s)'}")
 
@@ -304,7 +325,8 @@ def main():
     print(f"Remaining open seats after all moves + hires: {remaining_vacancy:.0f}")
 
     print("\nSample of exceptional (>30km) relocations:")
-    for e in (exceptions_b + exceptions_c)[:5]:
+    all_exceptions = [m for tier in ("A", "B") for m in moves_by_tier[tier] if m[2] > MAX_RELOCATION_KM]
+    for e in all_exceptions[:5]:
         person, place, d, s = e
         print(f"  {person['name']} ({person['tier']}) -> {place['name']}: {d:.1f}km, fit={s:.2f}")
 
