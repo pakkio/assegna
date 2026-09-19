@@ -89,7 +89,7 @@ trick.
   aside -- an over-cap move is only "exceptional" if it's a modest overage
   justified by a real fit gap, not an arbitrarily long one.
 
-### What isn't exact
+### What isn't exact -- and what's only integral so far, not proven integral
 
 The LP finds the true optimum *for the formulation as posed* (top-K candidate
 sets, the stated capacity/substitution constraints, the linear
@@ -101,6 +101,21 @@ already makes anyone's true best option land within their top-8, so the
 restriction currently costs nothing measured, even though nothing guarantees
 that in general (a different capability/distance distribution could make it
 bite).
+
+More importantly: the pure transportation problem (people <-> places, capacity
+only) is *provably* always integral at the LP optimum -- that's the total
+unimodularity argument earlier in this doc. The substitution constraint added
+on top of it (A/B needs a same-place backfill) is **not** covered by that
+proof -- it mixes variables across different destinations in a way the
+classical argument doesn't reach. Inspected directly: on the current dataset
+the solver's raw output (before any rounding) has **zero** fractional
+variables out of ~23,600 -- the LP optimum genuinely is the 0/1 optimum here,
+not a lucky rounding. But that's an empirical observation on this instance,
+not a general guarantee. `solve_joint_all` now checks this every run and
+raises loudly instead of silently rounding if a future dataset ever produces
+a fractional solution -- at that point the honest answer to "is this optimal"
+would be "not verified," and it would need a MILP solver (or a reformulation
+that restores total unimodularity) to actually be sure.
 
 Every constraint the pipeline claims to enforce (capacity limits, the
 substitution rule, `busy`/`protected_category` gating) has been independently

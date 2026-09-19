@@ -278,6 +278,22 @@ def solve_joint_all(employees, candidates, places, pool, capacity, place_idx):
     res = linprog(c=-scores, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=(0, 1), method="highs")
     if not res.success:
         raise RuntimeError(f"LP solver failed: {res.message}")
+
+    # The pure transportation problem is provably integral (total unimodularity), but the
+    # substitution constraint added on top of it is NOT part of that proof -- it mixes
+    # variables across different destinations in a way the classical TU argument doesn't
+    # cover. It has come out integral on every dataset tested so far, but that's an
+    # empirical observation, not a guarantee for every possible input. Fail loudly instead
+    # of silently rounding a fractional solution (which could be suboptimal or even
+    # constraint-violating after rounding) if that ever changes.
+    frac = np.minimum(res.x, 1 - res.x)
+    if frac.max() > 1e-6:
+        raise RuntimeError(
+            f"LP relaxation returned a fractional solution (max deviation from integer: "
+            f"{frac.max():.4f}) -- the substitution constraint broke integrality on this "
+            f"input. Rounding here would not be a verified-optimal result; this needs a "
+            f"MILP solver (or a reformulation) for this case, not a silent round(0.5)."
+        )
     chosen = res.x > 0.5
 
     emp_result = [edges[k] for k in range(num_vars) if chosen[k] and is_employee_edge[k]]
